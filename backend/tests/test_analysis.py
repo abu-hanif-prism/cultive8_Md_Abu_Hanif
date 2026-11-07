@@ -1,4 +1,4 @@
-import json
+﻿import json
 import time
 from pathlib import Path
 
@@ -14,10 +14,10 @@ from main import app
 from merge import merge_findings
 from pipeline import PipelineConfig, analyze_chunk, run_job
 from summary import build_summary
-from tokenizer import ApproxTokenizer
+from tokenizer import LogAwareTokenizer, get_tokenizer
 
 SAMPLE = Path(__file__).resolve().parents[2] / "sample-security.log"
-TOK = ApproxTokenizer()
+TOK = get_tokenizer()
 
 
 def numbered(path):
@@ -391,3 +391,22 @@ def test_api_report_not_ready_returns_409(api):
     store.create_job("pending", "x.log", 10)
     assert api.get("/api/analysis/pending/report").status_code == 409
     assert api.get("/api/analysis/pending").json()["status"] == "queued"
+
+
+# ---------------- tokenizer calibration (real Ollama counts, qwen3.5:0.8b) ----------------
+def test_tokenizer_is_not_prose_like_for_logs():
+    # Measured: this style of access-log text costs ~1.34 chars/token on the real model
+    # (the old 3 chars/token guess under-counted 2.2x and made Ollama silently truncate prompts).
+    line = '203.0.113.50 - - [07/Nov/2026:10:08:44 +0600] "POST /login HTTP/1.1" 401 450'
+    text = "\n".join(f"{i}: {line}" for i in range(253, 263))
+    chars_per_token = len(text) / get_tokenizer().count(text)
+    assert 1.0 <= chars_per_token <= 1.4, chars_per_token
+
+
+def test_tokenizer_never_underestimates_measured_log_counts():
+    # (chars, real token count) measured on Ollama for lines 1-40 of the generated test log
+    # and for sample-security.log; estimate must be >= real.
+    tok = get_tokenizer()
+    text = "\n".join(f"{i+1}: " + l for i, l in enumerate(SAMPLE.read_text().splitlines()))
+    assert tok.count(text) >= 2053  # real count measured for exactly this text
+    assert tok.count(text) <= 2053 * 1.2  # but not wildly pessimistic
