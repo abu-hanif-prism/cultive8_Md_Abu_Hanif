@@ -64,6 +64,8 @@ def merge_findings(findings: list[dict], ledger: Ledger | None = None) -> list[d
             "evidence_lines": ev[:MAX_EVIDENCE], "evidence_truncated": len(ev) > MAX_EVIDENCE,
             "reason": g["reason"], "suggested_action": g["suggested_action"],
             "sources": sorted(g["sources"]),
+            # Backed by the deterministic ledger (not just the model's opinion).
+            "corroborated": "ledger" in g["sources"],
         })
     out.sort(key=lambda f: (-SEV_RANK.get(f["severity"], 1), f["entity"], f["attack_type"]))
     return out

@@ -1,4 +1,4 @@
-﻿import json
+import json
 import time
 from pathlib import Path
 
@@ -410,3 +410,112 @@ def test_tokenizer_never_underestimates_measured_log_counts():
     text = "\n".join(f"{i+1}: " + l for i, l in enumerate(SAMPLE.read_text().splitlines()))
     assert tok.count(text) >= 2053  # real count measured for exactly this text
     assert tok.count(text) <= 2053 * 1.2  # but not wildly pessimistic
+
+
+# ---------------- circuit breaker / resume / corroborated ----------------
+def good_finding(entity="10.9.9.9", line=1):
+    return json.dumps({"findings": [{**GOOD, "entity": entity, "evidence_lines": [line]}]})
+
+
+def test_circuit_breaker_stops_after_consecutive_failures():
+    job = make_job()
+    client = FakeClient(default=None)
+    client.script = [ConnectionError("ollama down")] * 50
+    run_job(job, SAMPLE, client, cfg(max_retries=0, breaker_failures=3))
+    j = store.get_job(job)
+    assert j["status"] == "aborted" and "consecutive" in j["error"] and "ollama down" in j["error"]
+    assert client.calls == 3 and len(store.load_chunks(job)) == 3  # did not burn through every chunk
+    assert j["report_json"] is None
+
+
+def test_breaker_resets_after_a_success():
+    job = make_job()
+    client = FakeClient([ConnectionError("x"), ConnectionError("x"), '{"findings": []}',
+                         ConnectionError("x"), ConnectionError("x"), '{"findings": []}'])
+    run_job(job, SAMPLE, client, cfg(max_retries=0, breaker_failures=3))
+    assert store.get_job(job)["status"] == "completed_with_errors"  # never 3 in a row
+
+
+def test_resume_reuses_saved_chunks_and_retries_failed():
+    job = make_job()
+    first = FakeClient([good_finding("10.9.9.9", 1), '{"findings": []}'])
+    first.default = None
+    first.script += [ConnectionError("down")] * 20
+    run_job(job, SAMPLE, first, cfg(max_retries=0, breaker_failures=2))
+    assert store.get_job(job)["status"] == "aborted"
+    saved_done = [c["idx"] for c in store.load_chunks(job) if c["status"] == "done"]
+    assert saved_done == [0, 1]
+
+    second = FakeClient(default='{"findings": []}')
+    run_job(job, SAMPLE, second, cfg(max_retries=0, breaker_failures=2), resume=True)
+    j = store.get_job(job)
+    rows = store.load_chunks(job)
+    assert j["status"] == "completed" and all(r["status"] == "done" for r in rows)
+    assert second.calls == len(rows) - 2  # chunks 0 and 1 were not re-sent to the model
+    rep = json.loads(j["report_json"])
+    assert any(f["entity"] == "10.9.9.9" for f in rep["findings"])  # work from before the abort kept
+    assert any(f["attack_type"] == "brute_force_possible_compromise" for f in rep["findings"])  # ledger rebuilt
+
+
+def test_resume_refuses_when_chunk_layout_changed():
+    job = make_job()
+    first = FakeClient([good_finding(), ConnectionError("x"), ConnectionError("x")])
+    run_job(job, SAMPLE, first, cfg(max_retries=0, breaker_failures=2))
+    other = cfg(budget=TokenBudget(context_window=1000, system_prompt=300, context=250, output=300))  # 150/chunk
+    run_job(job, SAMPLE, FakeClient(), other, resume=True)
+    j = store.get_job(job)
+    assert j["status"] == "failed" and "layout changed" in j["error"]
+
+
+def test_corroborated_flag():
+    led = Ledger("access_log")
+    led.scan([(i, f'6.6.6.6 - - [07/Nov/2026:10:00:0{i} +0600] "POST /login HTTP/1.1" 401 1') for i in range(1, 8)])
+    out = merge_findings(led.to_findings() + [
+        F("6.6.6.6", "brute_force", "medium", [1, 2]),        # ledger agrees
+        F("5.5.5.5", "brute_force", "high", [3]),             # model only
+    ], led)
+    by = {(f["entity"], f["attack_type"]): f for f in out}
+    assert by[("6.6.6.6", "brute_force")]["corroborated"] is True
+    assert by[("5.5.5.5", "brute_force")]["corroborated"] is False
+
+
+def test_pipeline_marks_model_only_finding_unverified():
+    job = make_job()
+    run_job(job, SAMPLE, FakeClient(default=good_finding("192.168.1.5", 1)), cfg())
+    rep = json.loads(store.get_job(job)["report_json"])
+    f = next(f for f in rep["findings"] if f["entity"] == "192.168.1.5")
+    assert f["corroborated"] is False and rep["summary"]["unverified_findings"] >= 1
+    assert all(x["corroborated"] for x in rep["findings"] if x["entity"] == "192.168.1.15")
+
+
+def test_api_abort_then_resume(monkeypatch):
+    monkeypatch.setenv("CHUNK_MAX_RETRIES", "0")
+    monkeypatch.setenv("CIRCUIT_BREAKER_FAILURES", "2")
+    bad = FakeClient(default=None)
+    bad.script = [ConnectionError("down")] * 20
+    app.dependency_overrides[get_llm_client] = lambda: bad
+    try:
+        c = TestClient(app)
+        job = c.post("/api/analysis", files={"file": ("s.log", SAMPLE.read_bytes())}).json()["job_id"]
+        p = wait(c, job)
+        assert p["status"] == "aborted" and p["resumable"] is True and "consecutive" in p["error"]
+        assert c.get(f"/api/analysis/{job}/report").status_code == 409
+        app.dependency_overrides[get_llm_client] = lambda: FakeClient()
+        assert c.post(f"/api/analysis/{job}/resume").status_code == 202
+        end = time.time() + 10
+        while time.time() < end and c.get(f"/api/analysis/{job}").json()["status"] != "completed":
+            time.sleep(0.05)
+        assert c.get(f"/api/analysis/{job}").json()["status"] == "completed"
+        assert c.get(f"/api/analysis/{job}/report").status_code == 200
+        time.sleep(0.2)
+        assert not list((store.data_dir() / "uploads").glob("*.log"))  # removed only after success
+        assert c.post(f"/api/analysis/{job}/resume").status_code == 409  # already completed
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_api_resume_errors(api):
+    assert api.post("/api/analysis/nope/resume").status_code == 404
+    store.create_job("gone", "x.log", 10)
+    store.update_job("gone", status="aborted")
+    assert api.post("/api/analysis/gone/resume").status_code == 410  # upload no longer on disk

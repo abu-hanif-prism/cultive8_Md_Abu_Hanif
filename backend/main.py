@@ -11,7 +11,7 @@ from ingest import router as ingest_router  # noqa: E402
 
 app = FastAPI(title="Local AI Security Log Analyzer API")
 
-origins = [o.strip() for o in os.getenv("FRONTEND_ORIGIN", "http://localhost:3000").split(",")]
+origins = [o.strip() for o in os.getenv("FRONTEND_ORIGIN", "http://localhost:3000,http://127.0.0.1:3000").split(",")]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,

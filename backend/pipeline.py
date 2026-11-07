@@ -25,6 +25,7 @@ class PipelineConfig:
     summary_cap_tokens: int = field(default_factory=lambda: int(os.getenv("SUMMARY_CAP_TOKENS", "230")))
     max_retries: int = field(default_factory=lambda: int(os.getenv("CHUNK_MAX_RETRIES", "2")))
     timeout_s: float = field(default_factory=lambda: float(os.getenv("OLLAMA_TIMEOUT_S", "120")))
+    breaker_failures: int = field(default_factory=lambda: int(os.getenv("CIRCUIT_BREAKER_FAILURES", "3")))
     backoff_s: float = 1.0
     sleep: Callable[[float], None] = time.sleep  # injectable so tests do not wait
 
@@ -57,27 +58,59 @@ def run_job(
     client: LLMClient,
     cfg: PipelineConfig | None = None,
     tok: Tokenizer | None = None,
+    resume: bool = False,
 ) -> None:
+    """Run (or resume) a job.
+
+    Resume re-scans every chunk with the deterministic ledger (cheap, and needed
+    to rebuild its state) but skips the model call for chunks already saved as
+    "done". Failed chunks are retried. A circuit breaker aborts the job after
+    `cfg.breaker_failures` consecutive failed chunks (e.g. Ollama is down).
+    """
     cfg = cfg or PipelineConfig()
     tok = tok or get_tokenizer()
     try:
-        store.update_job(job_id, status="running")
+        store.update_job(
+            job_id, status="running", error=None, bytes_done=0, chunks_done=0, chunks_failed=0, report_json=None
+        )
         fmt = detect_format(sample_file(str(path)))
         store.update_job(job_id, log_format=fmt)
         ledger = Ledger(fmt, cfg.thresholds)
-        done = failed = 0
+        saved = {c["idx"]: c for c in store.load_chunks(job_id) if c["status"] == "done"} if resume else {}
+        done = failed = consecutive = 0
         with open(path, "rb") as f:
             for chunk in chunk_lines(iter_lines(f), tok, cfg.budget.chunk_tokens):
                 summary = build_summary(ledger, tok, cfg.summary_cap_tokens)  # earlier chunks only
                 ledger.scan(chunk.lines)
-                status, attempts, err, findings = analyze_chunk(chunk, summary, client, cfg)
-                # Persist immediately: finished chunks survive a later failure.
-                store.save_chunk(
-                    job_id, chunk.index, chunk.start_line, chunk.end_line, status, attempts, err, findings
-                )
+                prev = saved.get(chunk.index)
+                if prev is not None:
+                    if (prev["start_line"], prev["end_line"]) != (chunk.start_line, chunk.end_line):
+                        raise ValueError(
+                            f"Chunk {chunk.index} layout changed since the saved run "
+                            "(token budget or tokenizer differs); cannot resume"
+                        )
+                    status = "done"  # reuse the saved findings, no model call
+                else:
+                    status, attempts, err, findings = analyze_chunk(chunk, summary, client, cfg)
+                    # Persist immediately: finished chunks survive a later failure.
+                    store.save_chunk(
+                        job_id, chunk.index, chunk.start_line, chunk.end_line, status, attempts, err, findings
+                    )
+                    consecutive = consecutive + 1 if status == "failed" else 0
                 done += 1
                 failed += status == "failed"
                 store.update_job(job_id, bytes_done=chunk.end_byte, chunks_done=done, chunks_failed=failed)
+                if consecutive >= cfg.breaker_failures:
+                    store.update_job(
+                        job_id,
+                        status="aborted",
+                        error=(
+                            f"Stopped after {consecutive} consecutive chunk failures "
+                            f"(last: {err}). Completed chunks are saved; resume once the model is available."
+                        )[:400],
+                        finished_at=time.time(),
+                    )
+                    return
         report = build_report(job_id, ledger)
         store.update_job(
             job_id,
@@ -104,6 +137,7 @@ def build_report(job_id: str, ledger: Ledger) -> dict:
             "chunks_total": len(chunks),
             "chunks_failed": sum(c["status"] == "failed" for c in chunks),
             "complete": all(c["status"] == "done" for c in chunks),
+            "unverified_findings": sum(not f["corroborated"] for f in merged),
         },
         "findings": merged,
         "failed_chunks": [
