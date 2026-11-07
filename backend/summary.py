@@ -10,7 +10,9 @@ _LABEL = {
     "unauthorized_access": "401/403",
     "sql_injection": "SQLi",
     "rate_abuse": "peak req/min",
-    "path_probing": "404 paths",
+    "path_probing": "scanned paths",
+    "path_traversal": "traversal",
+    "prompt_injection": "injection text",
 }
 
 

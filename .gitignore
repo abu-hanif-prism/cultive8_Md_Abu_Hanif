@@ -29,7 +29,7 @@ next-env.d.ts
 backend/data/
 
 # Keep the committed sample log (tests use it)
-!sample-security.log
+!backend/tests/fixtures/*.log
 *.db
 *.db-wal
 *.db-shm

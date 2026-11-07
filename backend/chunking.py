@@ -14,7 +14,7 @@ _CONTINUATION = re.compile(r"^(\s+|Caused by:|\.\.\. \d+ more|Traceback )")
 @dataclass(frozen=True)
 class TokenBudget:
     context_window: int = 2048
-    system_prompt: int = 300
+    system_prompt: int = 450
     context: int = 250
     output: int = 512
 

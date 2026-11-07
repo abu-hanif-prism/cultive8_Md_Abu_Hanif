@@ -14,7 +14,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY, filename TEXT, status TEXT, size_bytes INTEGER,
     bytes_done INTEGER DEFAULT 0, chunks_done INTEGER DEFAULT 0, chunks_failed INTEGER DEFAULT 0,
-    log_format TEXT, error TEXT, report_json TEXT, created_at REAL, finished_at REAL
+    log_format TEXT, error TEXT, report_json TEXT, created_at REAL, finished_at REAL,
+    started_at REAL, model_seconds REAL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS chunk_results (
     job_id TEXT, idx INTEGER, start_line INTEGER, end_line INTEGER, status TEXT,
@@ -35,6 +36,11 @@ def _connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    for col, ddl in (('started_at', 'REAL'), ('model_seconds', 'REAL DEFAULT 0')):  # DBs from older versions
+        try:
+            conn.execute(f'ALTER TABLE jobs ADD COLUMN {col} {ddl}')
+        except sqlite3.OperationalError:
+            pass  # column already there
     return conn
 
 
@@ -48,6 +54,7 @@ def create_job(job_id: str, filename: str, size: int) -> None:
 
 _JOB_FIELDS = {
     "status", "bytes_done", "chunks_done", "chunks_failed", "log_format", "error", "report_json", "finished_at",
+    "started_at", "model_seconds",
 }
 
 

@@ -16,7 +16,7 @@ from pipeline import PipelineConfig, analyze_chunk, run_job
 from summary import build_summary
 from tokenizer import LogAwareTokenizer, get_tokenizer
 
-SAMPLE = Path(__file__).resolve().parents[2] / "sample-security.log"
+SAMPLE = Path(__file__).resolve().parent / "fixtures" / "sample-security.log"
 TOK = get_tokenizer()
 
 
@@ -80,7 +80,7 @@ def test_ledger_counts_and_lines(sample_ledger):
     assert b.counts["sqli"] == 3 and b.lines["sqli"] == [14, 15, 16]
     assert b.lines["denied"] == [15, 16]
     c = ip["192.168.1.40"]
-    assert len(c.paths_404) == 4 and c.counts["notfound"] == 4 and c.common_probe_hits == 4
+    assert len(c.probed) == 5 and c.counts["notfound"] == 4 and c.common_probe_hits == 5  # 4x404 + denied /server-status
     assert c.lines["denied"] == [30]
     assert ip["192.168.1.30"].peak_rate() == (10, 17, 26)
     assert ip["192.168.1.20"].counts["sqli"] == 0  # benign ?q=test
@@ -223,9 +223,9 @@ def F(entity, at, sev, ev, src="model", reason="r"):
 
 def test_merge_groups_unions_and_max_severity():
     out = merge_findings([
-        F("1.1.1.1", "sql_injection", "medium", [3, 1]),
-        F("1.1.1.1", "sql_injection", "high", [2, 3], reason="worse"),
-        F("2.2.2.2", "sql_injection", "low", [9]),
+        F("1.1.1.1", "sql_injection", "medium", [3, 1], src="ledger"),
+        F("1.1.1.1", "sql_injection", "high", [2, 3], src="ledger", reason="worse"),
+        F("2.2.2.2", "sql_injection", "low", [9], src="ledger"),
     ])
     assert len(out) == 2
     g = out[0]
@@ -257,7 +257,7 @@ def test_merge_no_escalation_when_success_precedes_failures():
 
 # ---------------- analyze_chunk ----------------
 def a_chunk():
-    return Chunk(index=0, lines=[(i, "x") for i in range(1, 11)])
+    return Chunk(index=0, lines=[(i, "1.2.3.4 GET /") for i in range(1, 11)])
 
 
 def test_retry_then_success():
@@ -438,7 +438,7 @@ def test_breaker_resets_after_a_success():
 
 def test_resume_reuses_saved_chunks_and_retries_failed():
     job = make_job()
-    first = FakeClient([good_finding("10.9.9.9", 1), '{"findings": []}'])
+    first = FakeClient([good_finding("192.168.1.5", 1), '{"findings": []}'])
     first.default = None
     first.script += [ConnectionError("down")] * 20
     run_job(job, SAMPLE, first, cfg(max_retries=0, breaker_failures=2))
@@ -453,7 +453,7 @@ def test_resume_reuses_saved_chunks_and_retries_failed():
     assert j["status"] == "completed" and all(r["status"] == "done" for r in rows)
     assert second.calls == len(rows) - 2  # chunks 0 and 1 were not re-sent to the model
     rep = json.loads(j["report_json"])
-    assert any(f["entity"] == "10.9.9.9" for f in rep["findings"])  # work from before the abort kept
+    assert any(f["entity"] == "192.168.1.5" for f in rep["findings"])  # work from before the abort kept
     assert any(f["attack_type"] == "brute_force_possible_compromise" for f in rep["findings"])  # ledger rebuilt
 
 
@@ -519,3 +519,28 @@ def test_api_resume_errors(api):
     store.create_job("gone", "x.log", 10)
     store.update_job("gone", status="aborted")
     assert api.post("/api/analysis/gone/resume").status_code == 410  # upload no longer on disk
+
+
+# ---------------- model-output gates ----------------
+def test_finding_dropped_when_cited_lines_do_not_mention_entity():
+    texts = {5: "203.0.113.72 GET /crops?search=%27%20OR%201=1--", 6: "203.0.113.44 POST /login 401"}
+    wrong = {**GOOD, "entity": "203.0.113.44", "attack_type": "sql_injection", "evidence_lines": [5]}
+    assert clean_finding(wrong, 1, 10, texts) is None  # lines belong to another IP
+    mixed = {**GOOD, "entity": "203.0.113.44", "evidence_lines": [5, 6]}
+    assert clean_finding(mixed, 1, 10, texts)["evidence_lines"] == [6]  # only the supporting line stays
+
+
+def test_model_only_findings_are_capped_low_and_not_counted_as_confirmed():
+    out = merge_findings([F("9.9.9.9", "brute_force", "critical", [3])])  # model only
+    assert out[0]["severity"] == "low" and out[0]["model_severity"] == "critical" and out[0]["corroborated"] is False
+    led = merge_findings([F("9.9.9.9", "brute_force", "high", [3], src="ledger"), F("9.9.9.9", "brute_force", "critical", [4])])
+    assert led[0]["severity"] == "high" and led[0]["corroborated"] is True  # ledger-backed keeps its severity
+
+
+def test_report_headline_counts_only_corroborated():
+    job = make_job()
+    junk = json.dumps({"findings": [{**GOOD, "entity": "192.168.1.5", "severity": "critical", "evidence_lines": [1]}]})
+    run_job(job, SAMPLE, FakeClient(default=junk), cfg())
+    s = json.loads(store.get_job(job)["report_json"])["summary"]
+    assert s["unverified_findings"] >= 1
+    assert s["total_findings"] == sum(s["by_severity"].values())  # model-only leads are not in the headline

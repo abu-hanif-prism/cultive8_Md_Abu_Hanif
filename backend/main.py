@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 load_dotenv()
 
 from analysis import router as analysis_router  # noqa: E402
+from analysis import system_router  # noqa: E402
 from ingest import router as ingest_router  # noqa: E402
 
 app = FastAPI(title="Local AI Security Log Analyzer API")
@@ -22,6 +23,7 @@ app.add_middleware(
 
 app.include_router(ingest_router)
 app.include_router(analysis_router)
+app.include_router(system_router)
 
 @app.get("/api/health")
 def health():

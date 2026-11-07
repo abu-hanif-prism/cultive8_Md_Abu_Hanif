@@ -1,4 +1,4 @@
-﻿import io
+import io
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,7 +16,7 @@ def chunks_of(text: str, budget: int):
 
 def test_budget_reserves_space():
     b = TokenBudget()
-    assert b.chunk_tokens == 2048 - 300 - 250 - 512
+    assert b.chunk_tokens == 2048 - 450 - 250 - 512
     with pytest.raises(ValueError):
         TokenBudget(context_window=500).chunk_tokens
 
@@ -93,7 +93,7 @@ def test_upload_ok_with_metadata_and_progress():
     body = r.json()
     assert body["total_lines"] == 1999
     assert body["progress_percent"] == 100.0
-    assert body["budget"]["chunk_tokens"] == 986
+    assert body["budget"]["chunk_tokens"] == 836
     assert body["chunks"][-1]["end_line"] == 1999
     assert body["chunks"][-1]["progress_percent"] == 100.0
     assert "text" not in body["chunks"][0]

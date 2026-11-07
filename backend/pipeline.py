@@ -8,7 +8,7 @@ from typing import Callable
 
 import store
 from chunking import Chunk, TokenBudget, chunk_lines, iter_lines
-from ledger import Ledger, Thresholds, detect_format, sample_file
+from ledger import Ledger, Thresholds, compact_line, detect_format, sample_file
 from llm import (
     FINDINGS_SCHEMA, SYSTEM_PROMPT, LLMClient, ParseError, build_user_prompt,
     clean_finding, parse_findings,
@@ -40,8 +40,11 @@ def analyze_chunk(chunk: Chunk, summary: str, client: LLMClient, cfg: PipelineCo
         try:
             raw = client.generate(SYSTEM_PROMPT, user, FINDINGS_SCHEMA, cfg.timeout_s)
             items, partial = parse_findings(raw)
+            texts = dict(chunk.lines)
             findings = [
-                f for f in (clean_finding(i, chunk.start_line, chunk.end_line) for i in items) if f
+                f
+                for f in (clean_finding(i, chunk.start_line, chunk.end_line, texts) for i in items)
+                if f
             ]
             note = "partial output salvaged" if partial else None
             return "done", attempts, note, findings
@@ -70,18 +73,38 @@ def run_job(
     cfg = cfg or PipelineConfig()
     tok = tok or get_tokenizer()
     try:
+        prior = store.get_job(job_id) or {}
+        model_seconds = float(prior.get("model_seconds") or 0) if resume else 0.0
         store.update_job(
-            job_id, status="running", error=None, bytes_done=0, chunks_done=0, chunks_failed=0, report_json=None
+            job_id, status="running", error=None, bytes_done=0, chunks_done=0, chunks_failed=0, report_json=None,
+            started_at=(prior.get("started_at") if resume and prior.get("started_at") else time.time()),
+            model_seconds=model_seconds,
         )
         fmt = detect_format(sample_file(str(path)))
         store.update_job(job_id, log_format=fmt)
         ledger = Ledger(fmt, cfg.thresholds)
         saved = {c["idx"]: c for c in store.load_chunks(job_id) if c["status"] == "done"} if resume else {}
         done = failed = consecutive = 0
+        # The model sees a compact view of each line (JSON noise fields dropped); the ledger
+        # scans the original. `raw` holds originals only for lines not yet scanned.
+        raw: dict[int, str] = {}
+
+        def prepared(fh):
+            for n, text, off in iter_lines(fh):
+                if fmt == "json_lines":
+                    raw[n] = text
+                    text = compact_line(text, fmt)
+                yield n, text, off
+
         with open(path, "rb") as f:
-            for chunk in chunk_lines(iter_lines(f), tok, cfg.budget.chunk_tokens):
+            for chunk in chunk_lines(prepared(f), tok, cfg.budget.chunk_tokens):
                 summary = build_summary(ledger, tok, cfg.summary_cap_tokens)  # earlier chunks only
-                ledger.scan(chunk.lines)
+                if fmt == "json_lines":
+                    ledger.scan([(n, raw[n]) for n in dict.fromkeys(n for n, _ in chunk.lines)])
+                    for n in [k for k in raw if k <= chunk.end_line]:
+                        del raw[n]
+                else:
+                    ledger.scan(chunk.lines)
                 prev = saved.get(chunk.index)
                 if prev is not None:
                     if (prev["start_line"], prev["end_line"]) != (chunk.start_line, chunk.end_line):
@@ -91,7 +114,9 @@ def run_job(
                         )
                     status = "done"  # reuse the saved findings, no model call
                 else:
+                    t_call = time.time()
                     status, attempts, err, findings = analyze_chunk(chunk, summary, client, cfg)
+                    model_seconds += time.time() - t_call
                     # Persist immediately: finished chunks survive a later failure.
                     store.save_chunk(
                         job_id, chunk.index, chunk.start_line, chunk.end_line, status, attempts, err, findings
@@ -99,7 +124,10 @@ def run_job(
                     consecutive = consecutive + 1 if status == "failed" else 0
                 done += 1
                 failed += status == "failed"
-                store.update_job(job_id, bytes_done=chunk.end_byte, chunks_done=done, chunks_failed=failed)
+                store.update_job(
+                    job_id, bytes_done=chunk.end_byte, chunks_done=done, chunks_failed=failed,
+                    model_seconds=model_seconds,
+                )
                 if consecutive >= cfg.breaker_failures:
                     store.update_job(
                         job_id,
@@ -128,11 +156,12 @@ def build_report(job_id: str, ledger: Ledger) -> dict:
     merged = merge_findings(ledger.to_findings() + model_findings, ledger)
     by_sev = {s: 0 for s in SEV_RANK}
     for f in merged:
-        by_sev[f["severity"]] += 1
+        if f["corroborated"]:  # unverified model leads are counted separately
+            by_sev[f["severity"]] += 1
     return {
         "job_id": job_id,
         "summary": {
-            "total_findings": len(merged),
+            "total_findings": sum(f["corroborated"] for f in merged),
             "by_severity": by_sev,
             "chunks_total": len(chunks),
             "chunks_failed": sum(c["status"] == "failed" for c in chunks),

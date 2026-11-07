@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -92,6 +93,20 @@ def _job_or_404(job_id: str) -> dict:
     return job
 
 
+def _timing(j: dict) -> dict:
+    start = j.get("started_at")
+    end = j.get("finished_at") or time.time()
+    elapsed = round(end - start, 1) if start else 0.0
+    pct = j["bytes_done"] / (j["size_bytes"] or 1)
+    live = not j["status"].startswith("completed") and j["status"] not in ("failed", "aborted")
+    return {
+        "elapsed_s": elapsed,
+        "model_seconds": round(j.get("model_seconds") or 0, 1),
+        "avg_chunk_s": round((j.get("model_seconds") or 0) / j["chunks_done"], 1) if j["chunks_done"] else None,
+        "eta_s": round(elapsed * (1 - pct) / pct) if live and pct > 0.02 else None,
+    }
+
+
 @router.get("/{job_id}")
 def progress(job_id: str):
     j = _job_or_404(job_id)
@@ -108,6 +123,7 @@ def progress(job_id: str):
         "chunks_failed": j["chunks_failed"],
         "finished": finished,
         "error": j["error"],
+        **_timing(j),
     }
 
 
@@ -121,3 +137,33 @@ def report(job_id: str):
     if not j["report_json"]:
         raise HTTPException(409, f"Report not ready (status: {j['status']})")
     return {"status": j["status"], **json.loads(j["report_json"])}
+
+
+system_router = APIRouter(prefix="/api")
+
+
+@system_router.get("/system")
+def system_info():
+    """RAM use of this backend and of the local model (the brief limits both to 4 GB total)."""
+    import httpx
+    import psutil
+
+    backend_mb = round(psutil.Process().memory_info().rss / 1e6)
+    model = None
+    try:
+        host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        models = httpx.get(f"{host}/api/ps", timeout=2).json().get("models", [])
+        if models:
+            m = models[0]
+            model = {
+                "name": m["name"], "size_mb": round(m["size"] / 1e6),
+                "on_gpu_mb": round(m.get("size_vram", 0) / 1e6),
+            }
+    except Exception:
+        pass  # Ollama not running or idle
+    return {
+        "backend_rss_mb": backend_mb,
+        "model": model,
+        "total_mb": backend_mb + (model["size_mb"] if model else 0),
+        "limit_mb": 4096,
+    }
